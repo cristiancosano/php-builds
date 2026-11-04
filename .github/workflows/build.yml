@@ -1,6 +1,7 @@
-# Comprueba cada día si hay versiones nuevas de PHP, las compila y las publica.
-# Compilar ejecuta código de terceros, así que ese job solo puede leer. Solo el
-# job de publicar puede escribir, y solo recibe binarios que han pasado las pruebas.
+# Comprueba cada día si faltan versiones de PHP por plataforma, las compila y las
+# publica. Compilar ejecuta código de terceros, así que ese job solo puede leer.
+# Solo el job de publicar puede escribir, y solo recibe binarios que han pasado
+# las pruebas.
 name: build
 
 on:
@@ -9,7 +10,11 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: "Versiones exactas separadas por espacios, p. ej. 8.4.27 8.5.12. Vacío: las soportadas que falten."
+        description: "Versiones exactas separadas por espacios, p. ej. 8.4.27 8.5.12. Vacío: las soportadas."
+        required: false
+        default: ""
+      platforms:
+        description: "Plataformas separadas por espacios. Vacío: todas."
         required: false
         default: ""
 
@@ -28,7 +33,7 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      versions: ${{ steps.plan.outputs.versions }}
+      matrix: ${{ steps.plan.outputs.matrix }}
       has_work: ${{ steps.plan.outputs.has_work }}
     steps:
       - id: plan
@@ -36,8 +41,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           REQUESTED: ${{ inputs.versions }}
+          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
+
+          declare -A runners=(
+            [macos-arm64]=macos-15
+            [linux-x86_64]=ubuntu-24.04
+            [linux-arm64]=ubuntu-24.04-arm
+            [windows-x64]=windows-2022
+          )
+
+          if [ -n "${REQUESTED_PLATFORMS:-}" ]; then
+            read -r -a platforms <<<"$REQUESTED_PLATFORMS"
+            for platform in "${platforms[@]}"; do
+              if [ -z "${runners[$platform]:-}" ]; then
+                echo "::error::Plataforma no válida: $platform"
+                exit 1
+              fi
+            done
+          else
+            platforms=(macos-arm64 linux-x86_64 linux-arm64 windows-x64)
+          fi
 
           if [ -n "${REQUESTED:-}" ]; then
             candidates="$(printf '%s\n' $REQUESTED)"
@@ -50,77 +75,119 @@ jobs:
               jq -r '[.[] | to_entries[] | .value.version] | .[]')"
           fi
 
-          existing="$(gh release list --limit 1000 --json tagName --jq '.[].tagName')"
-          missing=()
+          assets="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].assets[].name')"
+          entries=()
           while IFS= read -r version; do
             minor="${version%.*}"
             oldest="$(printf '%s\n%s\n' "$minor" "$MINIMUM_MINOR" | sort -V | head -n 1)"
             if [ -z "${REQUESTED:-}" ] && [ "$oldest" != "$MINIMUM_MINOR" ]; then
               continue
             fi
-            if ! grep -qx "php-$version" <<<"$existing"; then
-              missing+=("$version")
-            fi
+            for platform in "${platforms[@]}"; do
+              if ! grep -Eq "^php-${version//./\\.}-$platform\.(tar\.gz|zip)$" <<<"$assets"; then
+                entries+=("$(jq -cn --arg php "$version" --arg platform "$platform" --arg runner "${runners[$platform]}" \
+                  '{php: $php, platform: $platform, runner: $runner}')")
+              fi
+            done
           done <<<"$candidates"
 
-          echo "Versiones por compilar: ${missing[*]:-ninguna}"
-          if [ "${#missing[@]}" -eq 0 ]; then
+          echo "Por compilar: ${#entries[@]}"
+          printf '%s\n' "${entries[@]:-}"
+          if [ "${#entries[@]}" -eq 0 ]; then
             echo "has_work=false" >> "$GITHUB_OUTPUT"
-            echo "versions=[]" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
           else
             echo "has_work=true" >> "$GITHUB_OUTPUT"
-            echo "versions=$(printf '%s\n' "${missing[@]}" | jq -Rcs 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     needs: plan
     if: needs.plan.outputs.has_work == 'true'
-    runs-on: macos-15 # arm64
-    timeout-minutes: 180
+    name: build (${{ matrix.php }}, ${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        php: ${{ fromJSON(needs.plan.outputs.versions) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      PHP_VERSION: ${{ matrix.php }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Instalar herramientas de compilación
+      - name: Instalar herramientas (macOS)
+        if: startsWith(matrix.platform, 'macos')
         run: brew install autoconf automake bison cmake libtool pkgconf re2c
 
-      - name: Compilar
+      - name: Compilar (macOS)
+        if: startsWith(matrix.platform, 'macos')
         env:
           BUILD_XDEBUG: "1"
-          PHP_VERSION: ${{ matrix.php }}
           # spc lo usa para no agotar el límite de la API de GitHub.
           GITHUB_TOKEN: ${{ github.token }}
         run: ./build.sh "$PHP_VERSION"
 
-      - name: Probar
+      - name: Compilar (Linux)
+        if: startsWith(matrix.platform, 'linux')
         env:
-          PHP_VERSION: ${{ matrix.php }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./build-linux.sh "$PHP_VERSION"
+
+      - name: Compilar (Windows)
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./build-windows.ps1 -Version $env:PHP_VERSION
+
+      - name: Probar (macOS y Linux)
+        if: ${{ !startsWith(matrix.platform, 'windows') }}
         run: ./smoke-test.sh "dist/$PHP_VERSION" "$PHP_VERSION"
 
-      - name: Empaquetar
-        env:
-          PHP_VERSION: ${{ matrix.php }}
+      - name: Probar (Windows)
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
         run: |
+          & "dist\$env:PHP_VERSION\php.exe" -n smoke-test.php $env:PHP_VERSION windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Empaquetar
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir release
-          tar -czf "release/php-$PHP_VERSION-macos-arm64.tar.gz" -C "dist/$PHP_VERSION" .
+          name="php-$PHP_VERSION-$PLATFORM"
+          case "$PLATFORM" in
+            windows-*)
+              package="$name.zip"
+              (cd "dist/$PHP_VERSION" && 7z a -tzip "../../release/$package" . >/dev/null)
+              ;;
+            *)
+              package="$name.tar.gz"
+              tar -czf "release/$package" -C "dist/$PHP_VERSION" .
+              ;;
+          esac
           cd release
-          shasum -a 256 ./*.tar.gz | sed 's# \./# #' > SHA256SUMS
-          cat SHA256SUMS
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$package" > "$package.sha256"
+          else
+            shasum -a 256 "$package" > "$package.sha256"
+          fi
+          cat "$package.sha256"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: php-${{ matrix.php }}
+          name: php-${{ matrix.php }}-${{ matrix.platform }}
           path: release/
           if-no-files-found: error
           retention-days: 7
 
   publish:
     needs: [plan, build]
-    # Se ejecuta aunque falle otra versión; las que no compilaron no tienen artefacto.
+    # Se ejecuta aunque falle otra plataforma; las que no compilaron no tienen artefacto.
     if: ${{ !cancelled() && needs.plan.outputs.has_work == 'true' }}
+    name: publish (${{ matrix.php }}, ${{ matrix.platform }})
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -128,37 +195,43 @@ jobs:
       attestations: write
     strategy:
       fail-fast: false
-      matrix:
-        php: ${{ fromJSON(needs.plan.outputs.versions) }}
+      # Varias plataformas comparten release: de una en una para no chocar al crearla.
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - id: artifact
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: php-${{ matrix.php }}
+          name: php-${{ matrix.php }}-${{ matrix.platform }}
           path: release
 
       - if: steps.artifact.outcome == 'success'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: release/*.tar.gz
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip
 
-      - name: Crear la release
+      - name: Publicar en la release
         if: steps.artifact.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PHP_VERSION: ${{ matrix.php }}
         run: |
-          {
-            echo "PHP $PHP_VERSION estático para macOS arm64, compilado con static-php-cli."
-            echo
-            echo '```'
-            cat release/SHA256SUMS
-            echo '```'
-            echo
-            echo "Comprobar el origen: \`gh attestation verify php-$PHP_VERSION-macos-arm64.tar.gz --repo $GH_REPO\`"
-          } > notes.md
-          gh release create "php-$PHP_VERSION" release/* \
-            --title "PHP $PHP_VERSION (macOS arm64)" \
-            --notes-file notes.md
+          set -euo pipefail
+          tag="php-$PHP_VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            {
+              echo "PHP $PHP_VERSION estático, compilado con static-php-cli."
+              echo
+              echo "Comprobar el origen de un paquete:"
+              echo
+              echo '```sh'
+              echo "gh attestation verify <paquete> --repo $GH_REPO"
+              echo '```'
+            } > notes.md
+            gh release create "$tag" --title "PHP $PHP_VERSION" --notes-file notes.md
+          fi
+          gh release upload "$tag" release/*

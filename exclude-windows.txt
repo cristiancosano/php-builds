@@ -1,0 +1,13 @@
+# Extensiones de extensions.txt que no se compilan en Windows.
+# Marcadas como `no` en config/ext.json de static-php-cli 2.8.5: no existen en Windows.
+pcntl
+posix
+sysvmsg
+sysvsem
+# Marcadas como `wip`: static-php-cli aún no las soporta.
+gettext
+gmp
+imagick
+readline
+xsl
+zstd

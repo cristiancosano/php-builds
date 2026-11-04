@@ -1,26 +1,37 @@
 # php-builds
 
-PHP estático para macOS arm64, compilado con [static-php-cli](https://github.com/crazywhalecc/static-php-cli) y publicado en [Releases](../../releases). Son la fuente de versiones de PHP de LocalDeck, una app para gestionar el entorno de desarrollo local sin Docker ni máquinas virtuales.
+PHP estático para macOS, Linux y Windows, compilado con [static-php-cli](https://github.com/crazywhalecc/static-php-cli) y publicado en [Releases](../../releases). Son la fuente de versiones de PHP de LocalDeck, una app para gestionar el entorno de desarrollo local sin Docker ni máquinas virtuales.
 
 Proyecto personal, sin relación con PHP, static-php-cli ni Laravel Herd.
 
-## Qué incluye cada versión
+## Plataformas
 
-Cada `php-<versión>-macos-arm64.tar.gz` contiene:
+| Paquete | `php` | `php-fpm` | Xdebug | Extensiones que no incluye |
+|---|---|---|---|---|
+| `macos-arm64` | ✅ | ✅ | ✅ `xdebug.so` | — |
+| `linux-x86_64`, `linux-arm64` | ✅ | ✅ | ❌ | `ffi` |
+| `windows-x64` | ✅ `php.exe` | ❌ | ❌ | `gettext`, `gmp`, `imagick`, `pcntl`, `posix`, `readline`, `sysvmsg`, `sysvsem`, `xsl`, `zstd` |
 
-- `php` y `php-fpm`, con las extensiones de [`extensions.txt`](extensions.txt) dentro del binario.
-- `xdebug.so`, que se carga aparte con `zend_extension`. Xdebug es la versión que descarga static-php-cli y puede ser una alfa.
-- `license/`, con las licencias de PHP y de las librerías enlazadas.
-- `SHA256SUMS`.
+- **Linux:** usa musl y es totalmente estático, así que funciona en cualquier distribución, pero no puede cargar librerías dinámicas. Por eso no incluye Xdebug ni `ffi`.
+- **Windows:** PHP-FPM no existe en Windows. static-php-cli no soporta todavía parte de la lista, y otras extensiones no existen en ese sistema.
+
+La lista común está en [`extensions.txt`](extensions.txt), y las exclusiones en `exclude-linux.txt` y `exclude-windows.txt`. En todas las plataformas faltan también:
+
+- `sqlsrv`, `pdo_sqlsrv`, `mongodb` y `ldap`, por decisión propia, para simplificar la compilación.
+- `imap`: PHP 8.4 la sacó del núcleo y static-php-cli 2.8.5 falla al buscarla en `php-src`.
+
+Xdebug es la versión que descarga static-php-cli y puede ser una alfa.
 
 ## Uso
+
+Cada paquete incluye los binarios y la carpeta `license/`, y se publica junto a un `.sha256`.
 
 ```sh
 tar -xzf php-8.4.27-macos-arm64.tar.gz
 ./php -v
 ```
 
-Para comprobar que el archivo salió de este repositorio:
+Para comprobar que un paquete salió de este repositorio:
 
 ```sh
 gh attestation verify php-8.4.27-macos-arm64.tar.gz --repo cristiancosano/php-builds
@@ -28,24 +39,30 @@ gh attestation verify php-8.4.27-macos-arm64.tar.gz --repo cristiancosano/php-bu
 
 ## Publicación automática
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) consulta php.net cada día y compila las versiones soportadas, a partir de 8.3, que aún no tengan release. Una versión solo se publica si pasa [`smoke-test.sh`](smoke-test.sh). También se puede lanzar a mano con versiones concretas.
+[`.github/workflows/build.yml`](.github/workflows/build.yml) consulta php.net cada día y compila, a partir de PHP 8.3, cada combinación de versión y plataforma que aún no esté publicada. Si una plataforma falla, las demás se publican igual y esa se reintenta al día siguiente. Solo se publica lo que pasa las comprobaciones de [`smoke-test.php`](smoke-test.php).
+
+También se puede lanzar a mano con versiones y plataformas concretas.
 
 ## Compilar en local
 
 ```sh
+# macOS
 brew install autoconf automake bison cmake libtool pkgconf re2c
 BUILD_XDEBUG=1 ./build.sh 8.4
 ./smoke-test.sh dist/8.4.27 8.4.27
+
+# Linux (necesita git y Docker)
+./build-linux.sh 8.4.27
+./smoke-test.sh dist/8.4.27 8.4.27
+
+# Windows (PowerShell)
+./build-windows.ps1 -Version 8.4.27
+dist\8.4.27\php.exe -n smoke-test.php 8.4.27 windows
 ```
 
 En un M3 Pro, la primera compilación tarda unos 17 minutos y `.work/` ocupa 6 GB.
 
-`build.sh` usa las Command Line Tools en vez del Xcode activo, porque un Xcode más antiguo que el SDK no puede enlazar. Solo afecta a ese proceso y respeta un `DEVELOPER_DIR` ya definido.
-
-## Extensiones excluidas
-
-- `sqlsrv`, `pdo_sqlsrv`, `mongodb` y `ldap`, por decisión propia, para simplificar la compilación.
-- `imap`: PHP 8.4 la sacó del núcleo y static-php-cli 2.8.5 falla al buscarla en `php-src`.
+En macOS, `build.sh` usa las Command Line Tools en vez del Xcode activo, porque un Xcode más antiguo que el SDK no puede enlazar. Solo afecta a ese proceso y respeta un `DEVELOPER_DIR` ya definido.
 
 ## Licencias
 

@@ -1,0 +1,3 @@
+# Extensiones de extensions.txt que no se compilan en Linux.
+# musl estático no puede cargar librerías dinámicas.
+ffi
