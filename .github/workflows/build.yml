@@ -1,0 +1,164 @@
+# Comprueba cada día si hay versiones nuevas de PHP, las compila y las publica.
+# Compilar ejecuta código de terceros, así que ese job solo puede leer. Solo el
+# job de publicar puede escribir, y solo recibe binarios que han pasado las pruebas.
+name: build
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Versiones exactas separadas por espacios, p. ej. 8.4.27 8.5.12. Vacío: las soportadas que falten."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # Rama más antigua que se compila automáticamente.
+  MINIMUM_MINOR: "8.3"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED: ${{ inputs.versions }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${REQUESTED:-}" ]; then
+            candidates="$(printf '%s\n' $REQUESTED)"
+            if grep -Evq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$candidates"; then
+              echo "::error::Versiones no válidas: $REQUESTED"
+              exit 1
+            fi
+          else
+            candidates="$(curl -fsSL https://www.php.net/releases/active.php |
+              jq -r '[.[] | to_entries[] | .value.version] | .[]')"
+          fi
+
+          existing="$(gh release list --limit 1000 --json tagName --jq '.[].tagName')"
+          missing=()
+          while IFS= read -r version; do
+            minor="${version%.*}"
+            oldest="$(printf '%s\n%s\n' "$minor" "$MINIMUM_MINOR" | sort -V | head -n 1)"
+            if [ -z "${REQUESTED:-}" ] && [ "$oldest" != "$MINIMUM_MINOR" ]; then
+              continue
+            fi
+            if ! grep -qx "php-$version" <<<"$existing"; then
+              missing+=("$version")
+            fi
+          done <<<"$candidates"
+
+          echo "Versiones por compilar: ${missing[*]:-ninguna}"
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "versions=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+            echo "versions=$(printf '%s\n' "${missing[@]}" | jq -Rcs 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    runs-on: macos-15 # arm64
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(needs.plan.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Instalar herramientas de compilación
+        run: brew install autoconf automake bison cmake libtool pkgconf re2c
+
+      - name: Compilar
+        env:
+          BUILD_XDEBUG: "1"
+          PHP_VERSION: ${{ matrix.php }}
+          # spc lo usa para no agotar el límite de la API de GitHub.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./build.sh "$PHP_VERSION"
+
+      - name: Probar
+        env:
+          PHP_VERSION: ${{ matrix.php }}
+        run: ./smoke-test.sh "dist/$PHP_VERSION" "$PHP_VERSION"
+
+      - name: Empaquetar
+        env:
+          PHP_VERSION: ${{ matrix.php }}
+        run: |
+          mkdir release
+          tar -czf "release/php-$PHP_VERSION-macos-arm64.tar.gz" -C "dist/$PHP_VERSION" .
+          cd release
+          shasum -a 256 ./*.tar.gz | sed 's# \./# #' > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: php-${{ matrix.php }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    # Se ejecuta aunque falle otra versión; las que no compilaron no tienen artefacto.
+    if: ${{ !cancelled() && needs.plan.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(needs.plan.outputs.versions) }}
+    steps:
+      - id: artifact
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: php-${{ matrix.php }}
+          path: release
+
+      - if: steps.artifact.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*.tar.gz
+
+      - name: Crear la release
+        if: steps.artifact.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PHP_VERSION: ${{ matrix.php }}
+        run: |
+          {
+            echo "PHP $PHP_VERSION estático para macOS arm64, compilado con static-php-cli."
+            echo
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+            echo
+            echo "Comprobar el origen: \`gh attestation verify php-$PHP_VERSION-macos-arm64.tar.gz --repo $GH_REPO\`"
+          } > notes.md
+          gh release create "php-$PHP_VERSION" release/* \
+            --title "PHP $PHP_VERSION (macOS arm64)" \
+            --notes-file notes.md
