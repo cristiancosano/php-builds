@@ -1,6 +1,6 @@
 # php-builds
 
-PHP estático para macOS, Linux y Windows, compilado con [static-php-cli](https://github.com/crazywhalecc/static-php-cli) y publicado en [Releases](../../releases). Son la fuente de versiones de PHP de LocalDeck, una app para gestionar el entorno de desarrollo local sin Docker ni máquinas virtuales.
+PHP estático para macOS, Linux y Windows, compilado con [static-php-cli](https://github.com/crazywhalecc/static-php-cli) y publicado en [Releases](../../releases). Son la fuente de versiones de PHP de Elephant Stack, una app para gestionar el entorno de desarrollo local sin Docker ni máquinas virtuales.
 
 Proyecto personal, sin relación con PHP, static-php-cli ni Laravel Herd.
 
