@@ -67,3 +67,7 @@ En macOS, `build.sh` usa las Command Line Tools en vez del Xcode activo, porque 
 ## Licencias
 
 Los scripts de este repositorio están bajo licencia [MIT](LICENSE). Los binarios incluyen software con sus propias licencias, recogidas en `license/` dentro de cada paquete.
+
+## Fuentes fijadas
+
+static-php-cli 2.8.5 descarga algunas librerías de ramas que cambian solas. `libaom` se fija en la v3.14.1, porque desde la v3.15.0 deja de aplicar su parche para Linux. `libjxl` y la extensión `zstd` siguen saliendo de sus ramas principales, así que una compilación puede romperse sin cambios en este repositorio.

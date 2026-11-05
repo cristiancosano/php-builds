@@ -9,6 +9,10 @@ SPC_VERSION="2.8.5"
 SPC_COMMIT="4318ef8fa32a02460ec1554746674a7bc42b49fa"
 WITH_LIBS="freetype,libjpeg,libwebp,nghttp2"
 
+# spc 2.8.5 descarga libaom de su rama main, que cambia sola. Desde la v3.15.0
+# su parche para Linux ya no aplica, así que se fija la última versión compatible.
+LIBAOM_PIN="libaom:v3.14.1:https://aomedia.googlesource.com/aom"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 [ "$#" -eq 1 ] || { echo "uso: $0 <versión de PHP, p. ej. 8.4.27>" >&2; exit 2; }
@@ -31,7 +35,8 @@ if [ "$actual" != "$SPC_COMMIT" ]; then
 fi
 
 cd "$SRC"
-./bin/spc-alpine-docker download --with-php="$PHP_VERSION" --for-extensions="$EXTENSIONS" --retry=3
+./bin/spc-alpine-docker download --with-php="$PHP_VERSION" --for-extensions="$EXTENSIONS" \
+  --custom-git="$LIBAOM_PIN" --retry=3
 ./bin/spc-alpine-docker build "$EXTENSIONS" --with-libs="$WITH_LIBS" --build-cli --build-fpm
 
 DIST="$ROOT/dist/$PHP_VERSION"

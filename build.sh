@@ -14,6 +14,10 @@ SPC_URL="https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_
 # Bibliotecas opcionales: gd con JPEG, WebP y FreeType, y curl con HTTP/2.
 WITH_LIBS="freetype,libjpeg,libwebp,nghttp2"
 
+# spc 2.8.5 descarga libaom de su rama main, que cambia sola. Se fija la misma
+# versión que en Linux, donde desde la v3.15.0 deja de aplicar su parche.
+LIBAOM_PIN="libaom:v3.14.1:https://aomedia.googlesource.com/aom"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_XDEBUG="${BUILD_XDEBUG:-0}"
 
@@ -100,7 +104,8 @@ fi
 # $WORK/pkgroot. Las comprobaciones de arriba garantizan que no le falte nada
 # más, así que este arreglo automático no llega a lanzar `brew install`.
 "$SPC" doctor --auto-fix </dev/null
-"$SPC" download --with-php="$PHP_VERSION" --for-extensions="$download_exts" --retry=3 </dev/null
+"$SPC" download --with-php="$PHP_VERSION" --for-extensions="$download_exts" \
+  --custom-git="$LIBAOM_PIN" --retry=3 </dev/null
 "$SPC" build "$EXTENSIONS" --with-libs="$WITH_LIBS" --build-cli --build-fpm \
   ${shared_args[@]+"${shared_args[@]}"} </dev/null
 
