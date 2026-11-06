@@ -101,11 +101,12 @@ MYSQL_DOWNLOADS = "https://dev.mysql.com/downloads/mysql/"
 # Sistemas de la página de descargas: 33 macOS, 2 Linux genérico, 3 Windows.
 MYSQL_OS = {"macos-arm64": 33, "linux-x86_64": 2, "linux-arm64": 2, "windows-x64": 3}
 # Nombre del archivo por plataforma. El grupo "rank" ordena las variantes
-# (versión de macOS o de glibc): se elige la más alta.
+# (versión de macOS o de glibc): se elige la más alta y, en Linux, la variante
+# -minimal si existe (unos 80 MB frente a 1 GB; sin tests ni símbolos).
 MYSQL_FILES = {
     "macos-arm64": r"mysql-{v}-macos(?P<rank>\d+(?:\.\d+)?)-arm64\.tar\.gz",
-    "linux-x86_64": r"mysql-{v}-linux-glibc(?P<rank>\d+\.\d+)-x86_64\.tar\.xz",
-    "linux-arm64": r"mysql-{v}-linux-glibc(?P<rank>\d+\.\d+)-aarch64\.tar\.xz",
+    "linux-x86_64": r"mysql-{v}-linux-glibc(?P<rank>\d+\.\d+)-x86_64(?P<minimal>-minimal)?\.tar\.xz",
+    "linux-arm64": r"mysql-{v}-linux-glibc(?P<rank>\d+\.\d+)-aarch64(?P<minimal>-minimal)?\.tar\.xz",
     "windows-x64": r"mysql-{v}-winx64(?P<rank>)\.zip",
 }
 
@@ -129,7 +130,12 @@ def mysql_branches():
         branches.append({"branch": value, "version": match.group(1), "lts": "LTS" in match.group(2)})
     if not branches:
         raise RuntimeError("MySQL: el selector de versión está vacío")
-    return branches
+    # Las LTS y solo la innovation más reciente: una innovation queda sin
+    # soporte al salir la siguiente, y lo que no es LTS ni la última (8.0 tras
+    # su fin de vida) no se ofrece.
+    innovation = [b for b in branches if not b["lts"]]
+    newest = max(innovation, key=lambda b: version_key(b["version"]), default=None)
+    return [b for b in branches if b["lts"] or b is newest]
 
 
 def mysql_files(branch, os_id):
@@ -178,7 +184,10 @@ def mysql(previous, no_hash):
             if not candidates:
                 log(f"  aviso: MySQL {version} no tiene paquete para {platform}")
                 continue
-            match, md5 = max(candidates, key=lambda c: version_key(c[0].group("rank") or "0"))
+            match, md5 = max(
+                candidates,
+                key=lambda c: (version_key(c[0].group("rank") or "0"), bool(c[0].groupdict().get("minimal"))),
+            )
             url = f"https://dev.mysql.com/get/Downloads/MySQL-{branch}/{match.group(0)}"
             sha256, size = mysql_hash(url, md5, cache, no_hash)
             entries.append(entry(version, branch, platform, url, sha256, size, info["lts"]))
