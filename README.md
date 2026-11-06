@@ -43,6 +43,40 @@ gh attestation verify php-8.4.27-macos-arm64.tar.gz --repo cristiancosano/php-bu
 
 También se puede lanzar a mano con versiones y plataformas concretas.
 
+## Índice de servicios
+
+[`.github/workflows/services.yml`](.github/workflows/services.yml) publica cada día `services.json` en la release [`catalog`](../../releases/tag/catalog), junto a `index.json`. Lo genera [`services-index.py`](services-index.py) y no depende de la compilación de PHP. Contiene el último parche de cada rama soportada de MySQL, PostgreSQL y Mailpit:
+
+```json
+{
+  "schema": 1,
+  "generated_at": "2026-11-06T12:00:00Z",
+  "components": {
+    "mysql": [
+      {"version": "8.4.13", "branch": "8.4", "platform": "macos-arm64",
+       "url": "https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.13-macos15-arm64.tar.gz",
+       "sha256": "f324f895…", "size": 165362783, "lts": true}
+    ],
+    "postgresql": ["…"],
+    "mailpit": ["…"]
+  }
+}
+```
+
+Hay una entrada por versión y plataforma (`macos-arm64`, `linux-x86_64`, `linux-arm64`, `windows-x64`). Las URL son las de cada proyecto; este repositorio no redistribuye esos binarios.
+
+| Componente | Ramas | Binarios | sha256 |
+|---|---|---|---|
+| MySQL | Selector de versión de [dev.mysql.com/downloads/mysql](https://dev.mysql.com/downloads/mysql/); `lts` según su etiqueta | Oficiales | Calculado descargando el archivo y comprobando el MD5 de la página. Se reutiliza el del índice anterior si la URL no cambia |
+| PostgreSQL | `supported` en [versions.json](https://www.postgresql.org/versions.json); `lts` siempre `true` | [theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries) | `digest` del asset en GitHub |
+| Mailpit | Última release; `lts` siempre `false` | [axllent/mailpit](https://github.com/axllent/mailpit) | `digest` del asset en GitHub |
+
+Si una fuente falla, no se publica nada y se mantiene el índice anterior. Para probarlo en local sin descargar MySQL (pone un sha256 de ceros, que el workflow rechaza):
+
+```sh
+GH_TOKEN="$(gh auth token)" ./services-index.py --no-hash -o services.json
+```
+
 ## Compilar en local
 
 ```sh

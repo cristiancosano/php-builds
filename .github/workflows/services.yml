@@ -1,0 +1,72 @@
+# Publica services.json en la release `catalog`: el último parche de cada rama
+# soportada de MySQL, PostgreSQL y Mailpit, con su URL oficial, sha256 y tamaño.
+# Va aparte de build.yml para que un fallo en uno no impida el otro. Si alguna
+# fuente falla, no se sube nada y se queda el último índice bueno.
+name: services
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: services
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    # La primera ejecución descarga todos los paquetes de MySQL (unos 14 GB);
+    # las siguientes solo los nuevos.
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Descargar el índice anterior
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir previous
+          if ! gh release download catalog --pattern services.json --dir previous; then
+            echo "No hay services.json anterior: se descargará todo MySQL."
+          fi
+
+      - name: Generar services.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 services-index.py --previous previous/services.json --output services.json
+
+      - name: Comprobar services.json
+        run: |
+          set -euo pipefail
+          jq -e '
+            .schema == 1
+            and (.components | has("mysql") and has("postgresql") and has("mailpit"))
+            and any(.components.mysql[]; .platform == "macos-arm64")
+            and any(.components.postgresql[]; .platform == "macos-arm64")
+            and (.components.mailpit | length > 0)
+            and all(.components[][];
+              (.sha256 | test("^[0-9a-f]{64}$")) and .sha256 != ("0" * 64)
+              and .size > 0 and (.lts | type == "boolean")
+              and (.platform | IN("macos-arm64", "linux-x86_64", "linux-arm64", "windows-x64")))
+          ' services.json >/dev/null
+          jq -r '.components | to_entries[] | "\(.key): \([.value[].version] | unique | join(", "))"' services.json
+
+      - name: Publicar en la release catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh release view catalog >/dev/null 2>&1; then
+            gh release create catalog --prerelease --title "Índice de versiones" \
+              --notes "Índices para los clientes: index.json (PHP) y services.json (servicios). Se regeneran a diario."
+          fi
+          gh release upload catalog services.json --clobber
