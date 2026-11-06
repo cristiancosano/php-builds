@@ -28,6 +28,10 @@ concurrency:
 env:
   # Rama más antigua que se compila automáticamente.
   MINIMUM_MINOR: "8.3"
+  # Combinaciones rama:plataforma que no compilan con static-php-cli 2.8.5 y se
+  # omiten en la tarea diaria, para que no falle cada día. Se pueden pedir a mano.
+  # 8.3 en Windows falla al enlazar php.exe con el PHP SDK (nmake_cli_wrapper.bat).
+  SKIP: "8.3:windows-x64"
 
 jobs:
   plan:
@@ -84,6 +88,9 @@ jobs:
               continue
             fi
             for platform in "${platforms[@]}"; do
+              if [ -z "${REQUESTED:-}" ] && [[ " $SKIP " == *" $minor:$platform "* ]]; then
+                continue
+              fi
               if ! grep -Eq "^php-${version//./\\.}-$platform\.(tar\.gz|zip)$" <<<"$assets"; then
                 entries+=("$(jq -cn --arg php "$version" --arg platform "$platform" --arg runner "${runners[$platform]}" \
                   '{php: $php, platform: $platform, runner: $runner}')")
@@ -235,3 +242,30 @@ jobs:
             gh release create "$tag" --title "PHP $PHP_VERSION" --notes-file notes.md
           fi
           gh release upload "$tag" release/*
+
+  # Índice de versiones para los clientes (Elephant Stack). Tiene la forma de la
+  # API de releases, pero se descarga como archivo de la release `catalog`, que
+  # no cuenta para el límite de la API anónima de GitHub (60 consultas por hora
+  # y por IP). Se regenera en cada ejecución, haya compilado algo o no.
+  index:
+    needs: [plan, publish]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publicar index.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | startswith("php-")) | {tag_name, draft, prerelease, assets: [.assets[] | {name, browser_download_url, size}]}' |
+            jq -s 'sort_by(.tag_name) | reverse' > index.json
+          echo "Versiones en el índice: $(jq length index.json)"
+          if ! gh release view catalog >/dev/null 2>&1; then
+            gh release create catalog --prerelease --title "Índice de versiones" \
+              --notes "index.json con todas las versiones publicadas. Se regenera en cada ejecución del workflow."
+          fi
+          gh release upload catalog index.json --clobber
