@@ -1,0 +1,218 @@
+# Compila Redis (servidor, cli y benchmark) a partir de su código fuente, porque
+# Redis no publica binarios. Cada día busca el último parche de cada rama 8.x
+# soportada y compila lo que falte por plataforma. Igual que build.yml: compilar
+# solo puede leer, y solo el job de publicar puede escribir.
+#
+# Solo Redis 8 o posterior, que también se distribuye bajo AGPLv3. La 7.x solo
+# tiene RSALv2/SSPLv1, que no dejan claro si podemos redistribuir binarios.
+# Windows no está: Redis no lo soporta.
+name: redis
+
+on:
+  schedule:
+    - cron: "29 5 * * *"
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Versiones exactas separadas por espacios, p. ej. 8.2.11 8.10.3. Vacío: el último parche de cada rama soportada."
+        required: false
+        default: ""
+      platforms:
+        description: "Plataformas separadas por espacios. Vacío: todas."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redis
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED: ${{ inputs.versions }}
+          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+
+          declare -A runners=(
+            [macos-arm64]=macos-15
+            [linux-x86_64]=ubuntu-24.04
+            [linux-arm64]=ubuntu-24.04-arm
+          )
+
+          if [ -n "${REQUESTED_PLATFORMS:-}" ]; then
+            read -r -a platforms <<<"$REQUESTED_PLATFORMS"
+            for platform in "${platforms[@]}"; do
+              if [ -z "${runners[$platform]:-}" ]; then
+                echo "::error::Plataforma no válida: $platform"
+                exit 1
+              fi
+            done
+          else
+            platforms=(macos-arm64 linux-x86_64 linux-arm64)
+          fi
+
+          if [ -n "${REQUESTED:-}" ]; then
+            candidates="$(printf '%s\n' $REQUESTED)"
+            if grep -Evq '^([89]|[1-9][0-9]+)\.[0-9]+\.[0-9]+$' <<<"$candidates"; then
+              echo "::error::Versiones no válidas (solo Redis 8 o posterior): $REQUESTED"
+              exit 1
+            fi
+          else
+            # Ramas soportadas: la tabla de SECURITY.md de la rama principal.
+            branches="$(gh api -H "Accept: application/vnd.github.raw" repos/redis/redis/contents/SECURITY.md |
+              sed -nE 's/^\| *([0-9]+)\.([0-9]+)\.x *\| *:white_check_mark:.*/\1.\2/p' |
+              awk -F. '$1 >= 8')"
+            if [ -z "$branches" ]; then
+              echo "::error::SECURITY.md de redis/redis no tiene ramas 8.x soportadas"
+              exit 1
+            fi
+            echo "Ramas soportadas: $(paste -sd' ' - <<<"$branches")"
+            tags="$(gh api --paginate repos/redis/redis/releases \
+              --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' |
+              grep -E '^[0-9]+\.[0-9]+\.[0-9]+$')"
+            candidates=""
+            while IFS= read -r branch; do
+              latest="$(grep -F "$branch." <<<"$tags" | grep -E "^${branch//./\\.}\.[0-9]+$" | sort -V | tail -n 1 || true)"
+              if [ -z "$latest" ]; then
+                echo "::warning::Redis $branch no tiene ninguna release estable"
+                continue
+              fi
+              candidates+="$latest"$'\n'
+            done <<<"$branches"
+            candidates="${candidates%$'\n'}"
+          fi
+
+          assets="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].assets[].name')"
+          entries=()
+          while IFS= read -r version; do
+            [ -n "$version" ] || continue
+            for platform in "${platforms[@]}"; do
+              if ! grep -Fxq "redis-$version-$platform.tar.gz" <<<"$assets"; then
+                entries+=("$(jq -cn --arg redis "$version" --arg platform "$platform" --arg runner "${runners[$platform]}" \
+                  '{redis: $redis, platform: $platform, runner: $runner}')")
+              fi
+            done
+          done <<<"$candidates"
+
+          echo "Por compilar: ${#entries[@]}"
+          printf '%s\n' "${entries[@]:-}"
+          if [ "${#entries[@]}" -eq 0 ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    name: build (${{ matrix.redis }}, ${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      REDIS_VERSION: ${{ matrix.redis }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # En Linux compila dentro de Alpine (Docker); en macOS, con las Command
+      # Line Tools del runner. No necesita nada más.
+      - name: Compilar
+        run: ./build-redis.sh "$REDIS_VERSION"
+
+      - name: Probar
+        run: ./smoke-test-redis.sh "dist/redis-$REDIS_VERSION" "$REDIS_VERSION"
+
+      - name: Empaquetar
+        run: |
+          set -euo pipefail
+          mkdir release
+          package="redis-$REDIS_VERSION-$PLATFORM.tar.gz"
+          tar -czf "release/$package" -C dist "redis-$REDIS_VERSION"
+          cd release
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$package" > "$package.sha256"
+          else
+            shasum -a 256 "$package" > "$package.sha256"
+          fi
+          cat "$package.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: redis-${{ matrix.redis }}-${{ matrix.platform }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    # Se ejecuta aunque falle otra plataforma; las que no compilaron no tienen artefacto.
+    if: ${{ !cancelled() && needs.plan.outputs.has_work == 'true' }}
+    name: publish (${{ matrix.redis }}, ${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      # Varias plataformas comparten release: de una en una para no chocar al crearla.
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - id: artifact
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: redis-${{ matrix.redis }}-${{ matrix.platform }}
+          path: release
+
+      - if: steps.artifact.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*.tar.gz
+
+      - name: Publicar en la release
+        if: steps.artifact.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REDIS_VERSION: ${{ matrix.redis }}
+        run: |
+          set -euo pipefail
+          tag="redis-$REDIS_VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            {
+              echo "Redis $REDIS_VERSION (redis-server, redis-cli y redis-benchmark), compilado a partir del código fuente oficial, sin cambios en el código, sin TLS ni módulos."
+              echo
+              echo "- Linux: estático con musl, funciona en cualquier distribución."
+              echo "- macOS: solo depende de libSystem."
+              echo
+              echo "Redis se distribuye aquí bajo la [AGPLv3](https://www.gnu.org/licenses/agpl-3.0.html), una de sus tres licencias (\`LICENSE.txt\` en cada paquete)."
+              echo "Código fuente: https://download.redis.io/releases/redis-$REDIS_VERSION.tar.gz (sha256 en [redis/redis-hashes](https://github.com/redis/redis-hashes)); cómo se compila: [build-redis.sh](https://github.com/$GH_REPO/blob/$GITHUB_SHA/build-redis.sh)."
+              echo
+              echo "Comprobar el origen de un paquete:"
+              echo
+              echo '```sh'
+              echo "gh attestation verify <paquete> --repo $GH_REPO"
+              echo '```'
+            } > notes.md
+            gh release create "$tag" --title "Redis $REDIS_VERSION" --notes-file notes.md
+          fi
+          gh release upload "$tag" release/*
