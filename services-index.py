@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Genera services.json: el último parche de cada rama soportada de MySQL,
-PostgreSQL y Mailpit, con su URL oficial, sha256 y tamaño.
+PostgreSQL, Mailpit, Redis, phpMyAdmin y pgAdmin, con su URL, sha256 y tamaño.
 
 Uso:
     ./services-index.py [--previous services.json] [--no-hash] [-o services.json]
 
---previous  índice anterior. Si una entrada de MySQL tiene la misma versión,
-            plataforma y URL, se reutiliza su sha256 y tamaño en vez de
-            descargar el archivo otra vez.
---no-hash   no descarga MySQL: toma el tamaño de la cabecera y pone un sha256
-            ficticio (ceros). Solo para probar en local; el CI no lo usa.
+--previous  índice anterior. Si una entrada de MySQL o pgAdmin tiene la misma
+            URL, se reutiliza su sha256 y tamaño en vez de descargar el
+            archivo otra vez.
+--no-hash   no descarga MySQL ni pgAdmin: toma el tamaño de la cabecera y pone
+            un sha256 ficticio (ceros). Solo para probar en local; el CI no lo
+            usa.
 
 Las consultas a la API de GitHub usan GH_TOKEN o GITHUB_TOKEN si existen.
 Sale con error si alguna fuente falla o no encuentra nada, para no publicar un
@@ -72,7 +73,7 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def entry(version, branch, platform, url, sha256, size, lts):
+def entry(version, branch, platform, url, sha256, size, lts, **extra):
     if not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise RuntimeError(f"sha256 no válido para {url}: {sha256}")
     if not isinstance(size, int) or size <= 0:
@@ -85,7 +86,39 @@ def entry(version, branch, platform, url, sha256, size, lts):
         "sha256": sha256,
         "size": size,
         "lts": lts,
+        **extra,
     }
+
+
+def content_length(url):
+    headers = curl(url, "-I")
+    lengths = re.findall(r"(?im)^content-length:\s*(\d+)", headers)
+    if not lengths:
+        raise RuntimeError(f"sin content-length para {url}")
+    return int(lengths[-1])
+
+
+def download_hash(url, previous, no_hash, md5=None):
+    """sha256 y tamaño de url, descargándolo salvo que el índice anterior ya
+    tenga esa URL. Si se da md5, comprueba que coincide."""
+    cached = previous.get(url)
+    if cached and cached["sha256"] != FAKE_SHA256:
+        return cached["sha256"], cached["size"]
+    if no_hash:
+        return FAKE_SHA256, content_length(url)
+    log(f"  descargando {url}")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "file")
+        curl(url, output=path)
+        sha256, md5sum, size = hashlib.sha256(), hashlib.md5(), 0
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                sha256.update(chunk)
+                md5sum.update(chunk)
+                size += len(chunk)
+    if md5 and md5sum.hexdigest() != md5:
+        raise RuntimeError(f"el MD5 de {url} no coincide con el publicado")
+    return sha256.hexdigest(), size
 
 
 def github_digest(asset):
@@ -145,31 +178,6 @@ def mysql_files(branch, os_id):
     return dict(files)
 
 
-def mysql_hash(url, md5, previous, no_hash):
-    cached = previous.get(url)
-    if cached and cached["sha256"] != FAKE_SHA256:
-        return cached["sha256"], cached["size"]
-    if no_hash:
-        headers = curl(url, "-I")
-        lengths = re.findall(r"(?im)^content-length:\s*(\d+)", headers)
-        if not lengths:
-            raise RuntimeError(f"MySQL: sin content-length para {url}")
-        return FAKE_SHA256, int(lengths[-1])
-    log(f"  descargando {url}")
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "file")
-        curl(url, output=path)
-        sha256, md5sum, size = hashlib.sha256(), hashlib.md5(), 0
-        with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                sha256.update(chunk)
-                md5sum.update(chunk)
-                size += len(chunk)
-    if md5sum.hexdigest() != md5:
-        raise RuntimeError(f"MySQL: el MD5 de {url} no coincide con la página")
-    return sha256.hexdigest(), size
-
-
 def mysql(previous, no_hash):
     cache = {item["url"]: item for item in previous.get("mysql", [])}
     entries = []
@@ -189,7 +197,7 @@ def mysql(previous, no_hash):
                 key=lambda c: (version_key(c[0].group("rank") or "0"), bool(c[0].groupdict().get("minimal"))),
             )
             url = f"https://dev.mysql.com/get/Downloads/MySQL-{branch}/{match.group(0)}"
-            sha256, size = mysql_hash(url, md5, cache, no_hash)
+            sha256, size = download_hash(url, cache, no_hash, md5=md5)
             entries.append(entry(version, branch, platform, url, sha256, size, info["lts"]))
         log(f"MySQL {version}{' LTS' if info['lts'] else ''}")
     if not any(e["platform"] == "macos-arm64" for e in entries):
@@ -268,10 +276,98 @@ def mailpit():
     return entries
 
 
+# ---------------------------------------------------------------- Redis
+
+# Lo compila redis.yml en este repositorio y lo publica en releases redis-<v>.
+REDIS_REPO = "cristiancosano/php-builds"
+REDIS_PLATFORMS = ("macos-arm64", "linux-x86_64", "linux-arm64")
+REDIS_SECURITY = "https://raw.githubusercontent.com/redis/redis/HEAD/SECURITY.md"
+
+
+def redis():
+    """Por cada rama 8.x soportada y plataforma, la versión más reciente que
+    hayamos publicado. Si un parche nuevo aún no ha compilado en una
+    plataforma, esa plataforma se queda en el anterior."""
+    security = curl(REDIS_SECURITY)
+    branches = [
+        f"{major}.{minor}"
+        for major, minor in re.findall(r"(?m)^\|\s*(\d+)\.(\d+)\.x\s*\|\s*:white_check_mark:", security)
+        if int(major) >= 8
+    ]
+    if not branches:
+        raise RuntimeError("Redis: SECURITY.md no tiene ramas 8.x soportadas")
+    releases = [
+        r for r in github(f"repos/{REDIS_REPO}/releases")
+        if not r["draft"] and re.fullmatch(r"redis-\d+\.\d+\.\d+", r["tag_name"])
+    ]
+    entries = []
+    for branch in sorted(branches, key=version_key):
+        candidates = sorted(
+            (r for r in releases if r["tag_name"].removeprefix("redis-").startswith(branch + ".")),
+            key=lambda r: version_key(r["tag_name"].removeprefix("redis-")),
+            reverse=True,
+        )
+        versions = set()
+        for platform in REDIS_PLATFORMS:
+            for release in candidates:
+                version = release["tag_name"].removeprefix("redis-")
+                asset = next((a for a in release["assets"] if a["name"] == f"redis-{version}-{platform}.tar.gz"), None)
+                if asset:
+                    entries.append(entry(version, branch, platform, asset["browser_download_url"],
+                                         github_digest(asset), asset["size"], False))
+                    versions.add(version)
+                    break
+            else:
+                log(f"  aviso: no hay Redis {branch} para {platform}")
+        if versions:
+            log(f"Redis {', '.join(sorted(versions, key=version_key))}")
+    if not any(e["platform"] == "macos-arm64" for e in entries):
+        raise RuntimeError("Redis: no se ha encontrado ningún paquete para macos-arm64")
+    return entries
+
+
+# ----------------------------------------------------------- phpMyAdmin
+
+
+def phpmyadmin():
+    """Solo la última versión estable (version.json la pone la primera)."""
+    info = json.loads(curl("https://www.phpmyadmin.net/home_page/version.json"))
+    version = info.get("version", "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError(f"phpMyAdmin: versión inesperada en version.json: {version!r}")
+    release = next((r for r in info.get("releases", []) if r.get("version") == version), None)
+    if not release or not release.get("php_versions"):
+        raise RuntimeError(f"phpMyAdmin: version.json no tiene php_versions para {version}")
+    url = f"https://files.phpmyadmin.net/phpMyAdmin/{version}/phpMyAdmin-{version}-all-languages.zip"
+    checksum = curl(f"{url}.sha256").split()
+    if not checksum or not re.fullmatch(r"[0-9a-f]{64}", checksum[0]):
+        raise RuntimeError(f"phpMyAdmin: {url}.sha256 no tiene un sha256 válido")
+    log(f"phpMyAdmin {version}")
+    return [entry(version, ".".join(version.split(".")[:2]), "any", url, checksum[0],
+                  content_length(url), False, php=release["php_versions"])]
+
+
+# -------------------------------------------------------------- pgAdmin
+
+
+def pgadmin(previous, no_hash):
+    """Solo macOS arm64. pgAdmin no publica checksums: se calcula descargando
+    el .dmg, salvo que el índice anterior ya tenga esa URL."""
+    cache = {item["url"]: item for item in previous.get("pgadmin", [])}
+    info = json.loads(curl("https://www.pgadmin.org/versions.json"))
+    version = (info.get("pgadmin4") or {}).get("version", "")
+    if not re.fullmatch(r"\d+\.\d+", version):
+        raise RuntimeError(f"pgAdmin: versión inesperada en versions.json: {version!r}")
+    url = f"https://ftp.postgresql.org/pub/pgadmin/pgadmin4/v{version}/macos/pgadmin4-{version}-arm64.dmg"
+    sha256, size = download_hash(url, cache, no_hash)
+    log(f"pgAdmin {version}")
+    return [entry(version, version.split(".")[0], "macos-arm64", url, sha256, size, False)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--previous", help="services.json anterior, para reutilizar los sha256 de MySQL")
-    parser.add_argument("--no-hash", action="store_true", help="no descargar MySQL (sha256 ficticio)")
+    parser.add_argument("--previous", help="services.json anterior, para reutilizar los sha256 de MySQL y pgAdmin")
+    parser.add_argument("--no-hash", action="store_true", help="no descargar MySQL ni pgAdmin (sha256 ficticio)")
     parser.add_argument("-o", "--output", default="services.json")
     args = parser.parse_args()
 
@@ -287,6 +383,9 @@ def main():
             "mysql": mysql(previous, args.no_hash),
             "postgresql": postgresql(),
             "mailpit": mailpit(),
+            "redis": redis(),
+            "phpmyadmin": phpmyadmin(),
+            "pgadmin": pgadmin(previous, args.no_hash),
         },
     }
     with open(args.output, "w") as handle:

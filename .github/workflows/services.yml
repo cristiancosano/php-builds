@@ -1,5 +1,6 @@
 # Publica services.json en la release `catalog`: el último parche de cada rama
-# soportada de MySQL, PostgreSQL y Mailpit, con su URL oficial, sha256 y tamaño.
+# soportada de MySQL, PostgreSQL, Mailpit, Redis (compilado en redis.yml),
+# phpMyAdmin y pgAdmin, con su URL, sha256 y tamaño.
 # Va aparte de build.yml para que un fallo en uno no impida el otro. Si alguna
 # fuente falla, no se sube nada y se queda el último índice bueno.
 name: services
@@ -19,8 +20,8 @@ concurrency:
 jobs:
   index:
     runs-on: ubuntu-latest
-    # La primera ejecución descarga todos los paquetes de MySQL (unos 14 GB);
-    # las siguientes solo los nuevos.
+    # La primera ejecución descarga todos los paquetes de MySQL (unos 14 GB) y
+    # el .dmg de pgAdmin; las siguientes solo los nuevos.
     timeout-minutes: 120
     permissions:
       contents: write
@@ -35,7 +36,7 @@ jobs:
           set -euo pipefail
           mkdir previous
           if ! gh release download catalog --pattern services.json --dir previous; then
-            echo "No hay services.json anterior: se descargará todo MySQL."
+            echo "No hay services.json anterior: se descargará todo MySQL y pgAdmin."
           fi
 
       - name: Generar services.json
@@ -48,14 +49,22 @@ jobs:
           set -euo pipefail
           jq -e '
             .schema == 1
-            and (.components | has("mysql") and has("postgresql") and has("mailpit"))
+            and (.components | has("mysql") and has("postgresql") and has("mailpit")
+              and has("redis") and has("phpmyadmin") and has("pgadmin"))
             and any(.components.mysql[]; .platform == "macos-arm64")
             and any(.components.postgresql[]; .platform == "macos-arm64")
             and (.components.mailpit | length > 0)
+            and any(.components.redis[]; .platform == "macos-arm64")
+            and all(.components.redis[]; .platform != "windows-x64" and (.branch as $b | .version | startswith($b + ".")))
+            and (.components.phpmyadmin | length == 1)
+            and all(.components.phpmyadmin[]; .platform == "any" and (.php | type == "string" and length > 0))
+            and any(.components.pgadmin[]; .platform == "macos-arm64")
             and all(.components[][];
-              (.sha256 | test("^[0-9a-f]{64}$")) and .sha256 != ("0" * 64)
+              (.version | type == "string") and (.branch | type == "string")
+              and (.url | startswith("https://"))
+              and (.sha256 | test("^[0-9a-f]{64}$")) and .sha256 != ("0" * 64)
               and .size > 0 and (.lts | type == "boolean")
-              and (.platform | IN("macos-arm64", "linux-x86_64", "linux-arm64", "windows-x64")))
+              and (.platform | IN("macos-arm64", "linux-x86_64", "linux-arm64", "windows-x64", "any")))
           ' services.json >/dev/null
           jq -r '.components | to_entries[] | "\(.key): \([.value[].version] | unique | join(", "))"' services.json
 
