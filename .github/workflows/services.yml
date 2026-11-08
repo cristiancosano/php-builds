@@ -50,7 +50,7 @@ jobs:
           jq -e '
             .schema == 1
             and (.components | has("mysql") and has("postgresql") and has("mailpit")
-              and has("redis") and has("phpmyadmin") and has("pgadmin"))
+              and has("redis") and has("phpmyadmin") and has("pgadmin") and has("caddy"))
             and any(.components.mysql[]; .platform == "macos-arm64")
             and any(.components.postgresql[]; .platform == "macos-arm64")
             and (.components.mailpit | length > 0)
@@ -59,6 +59,7 @@ jobs:
             and (.components.phpmyadmin | length == 1)
             and all(.components.phpmyadmin[]; .platform == "any" and (.php | type == "string" and length > 0))
             and any(.components.pgadmin[]; .platform == "macos-arm64")
+            and any(.components.caddy[]; .platform == "macos-arm64")
             and all(.components[][];
               (.version | type == "string") and (.branch | type == "string")
               and (.url | startswith("https://"))

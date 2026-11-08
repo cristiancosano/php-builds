@@ -276,6 +276,39 @@ def mailpit():
     return entries
 
 
+# ---------------------------------------------------------------- Caddy
+
+# Servidor web de los sitios de Elephant (07-sitios-propios.md). Binarios
+# oficiales de caddyserver/caddy; sha256 del digest del asset.
+CADDY_ASSETS = {
+    "macos-arm64": "caddy_{v}_mac_arm64.tar.gz",
+    "linux-x86_64": "caddy_{v}_linux_amd64.tar.gz",
+    "linux-arm64": "caddy_{v}_linux_arm64.tar.gz",
+    "windows-x64": "caddy_{v}_windows_amd64.zip",
+}
+
+
+def caddy():
+    release = github("repos/caddyserver/caddy/releases/latest")
+    version = release["tag_name"].removeprefix("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError(f"Caddy: tag inesperado {release['tag_name']}")
+    assets = {a["name"]: a for a in release["assets"]}
+    entries = []
+    for platform, pattern in CADDY_ASSETS.items():
+        name = pattern.format(v=version)
+        asset = assets.get(name)
+        if not asset:
+            log(f"  aviso: Caddy {version} no tiene {name}")
+            continue
+        entries.append(entry(version, version.split(".")[0], platform, asset["browser_download_url"],
+                             github_digest(asset), asset["size"], False))
+    log(f"Caddy {version}")
+    if not any(e["platform"] == "macos-arm64" for e in entries):
+        raise RuntimeError("Caddy: la última release no tiene paquete para macos-arm64")
+    return entries
+
+
 # ---------------------------------------------------------------- Redis
 
 # Lo compila redis.yml en este repositorio y lo publica en releases redis-<v>.
@@ -386,6 +419,7 @@ def main():
             "redis": redis(),
             "phpmyadmin": phpmyadmin(),
             "pgadmin": pgadmin(previous, args.no_hash),
+            "caddy": caddy(),
         },
     }
     with open(args.output, "w") as handle:
